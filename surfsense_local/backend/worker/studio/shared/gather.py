@@ -8,9 +8,9 @@ from modules.documents.models import Document
 from shared import search
 from worker.studio.shared.artifact import Source
 
-# One job's grounding budget in characters, unless the model's profile sets one.
-# ponytail: a flat cap, not tokens. Ceiling: fine while one window holds it;
-# count tokens if prompts start to overflow.
+# One job's grounding budget in characters, unless the caller prices one for
+# the model that will read it. Priced there now (worker.studio.shared.budget):
+# a flat cap overflowed the window it was meant to guard (#2421).
 BUDGET_CHARS = 24_000
 
 # Below this even share a document says nothing, so the scope's best passages

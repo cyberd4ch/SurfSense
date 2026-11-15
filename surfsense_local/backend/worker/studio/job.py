@@ -63,7 +63,7 @@ from worker.studio.revised_copy import pipeline as revised_copy
 from worker.studio.revised_copy.record import record as record_revision
 from worker.studio.script_document import pipeline as script_document
 from worker.studio.script_document.pipeline import ScriptRunFailedError
-from worker.studio.shared import gather, persist
+from worker.studio.shared import budget, gather, persist
 from worker.studio.shared.artifact import Built
 from worker.studio.web.html.written import page as written_page
 
@@ -185,6 +185,10 @@ def _generate(session: Session, artifact: Artifact) -> None:
             NonRetryableImageError | NonRetryableSpeechError | NotEnoughMemoryError,
         ):
             return
+        # The same grounding on the same window overflows the same way: a retry
+        # re-drafts for minutes and fails identically (#2421).
+        if budget.is_context_overflow(failure):
+            return
         # The agent's script document is never retried: its agent reads this FAILED
         # and renders a fix as a new version, which a retry turning READY would race.
         # A Studio draft's kept spec does not count: its Retry asks the model again.
@@ -210,6 +214,16 @@ def _draft(session: Session, artifact: Artifact, document: Document) -> Built:
     prompt = meta.get("prompt")
     kind = job_router.Kind(artifact.format)
     fmt = FORMATS_BY_KEY[kind]
+    models = [
+        _choose_model(session, model_type) for model_type in fmt.requires_model_types
+    ]
+    # The text model prices the grounding: its window is what the request must
+    # fit. The image and speech models read the artifact, not the sources.
+    writer = next(
+        model
+        for model_type, model in zip(fmt.requires_model_types, models, strict=True)
+        if model_type is ModelType.TEXT_GEN
+    )
     # The prompt is what to search for, where the format reads passages.
     query = prompt if fmt.grounding is Grounding.PASSAGES else None
     sources = gather.gather(
@@ -217,6 +231,7 @@ def _draft(session: Session, artifact: Artifact, document: Document) -> Built:
         meta.get("source_document_ids", []),
         query,
         focus=prompt or fmt.default_focus,
+        budget_chars=budget.grounding_budget_chars(writer),
     )
     if kind in job_router.PLACES_FIGURES:
         sources = figure_shelf.with_figures(session, artifact.workspace_id, sources)
@@ -231,9 +246,6 @@ def _draft(session: Session, artifact: Artifact, document: Document) -> Built:
         len(sources),
         sum(len(source.content) for source in sources),
     )
-    models = [
-        _choose_model(session, model_type) for model_type in fmt.requires_model_types
-    ]
     # Options were checked at job creation; only formats that take them get them.
     extras = [meta.get("options")] if fmt.validate_options else []
     # Generation runs for minutes; the write lock must not be held across it.
@@ -368,6 +380,8 @@ def _reason(failure: Exception) -> str:
     """
     if isinstance(failure, ScriptRunFailedError):
         return script_error(failure.reason(MESSAGE_CHARS - len(PREFIX)))
+    if budget.is_context_overflow(failure):
+        return budget.overflow_reason()
     if isinstance(failure, httpx.HTTPError):
         return f"The model could not be reached: {failure}"[:MESSAGE_CHARS]
     first_line = str(failure).strip().splitlines()[:1]
